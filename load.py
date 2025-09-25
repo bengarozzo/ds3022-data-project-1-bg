@@ -96,7 +96,7 @@ def load_parquet_files():
         """)
         logger.info("Loaded vehicle_emissions.csv")
 
-        # Summaries (rubric: basic data summarization)
+        # Summaries (basic data summarization)
         yellow_summary = con.execute("SELECT COUNT(*), MIN(pickup_datetime), MAX(pickup_datetime) FROM yellow_trips_2024;").fetchone()
         green_summary = con.execute("SELECT COUNT(*), MIN(pickup_datetime), MAX(pickup_datetime) FROM green_trips_2024;").fetchone()
         emissions_count = con.execute("SELECT COUNT(*) FROM vehicle_emissions;").fetchone()[0]
