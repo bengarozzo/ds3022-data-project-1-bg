@@ -4,11 +4,18 @@ import sys
 import os
 import matplotlib.pyplot as plt
 
-# --- Config paths ---
+# =========================
+# Config / Constants
+# =========================
 LOG_PATH = "analysis.log"
 DB_PATH = "emissions.duckdb"
 
-# --- Logging setup ---
+YELLOW_TBL = "yellow_trips_all_transformed"
+GREEN_TBL  = "green_trips_all_transformed"
+
+# =========================
+# Logging
+# =========================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(levelname)s - %(message)s",
@@ -16,16 +23,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# --- Table names (from transform.py) ---
-YELLOW_TBL = "yellow_trips_2024_transformed"
-GREEN_TBL = "green_trips_2024_transformed"
-
-# --------------------------
-# Helper functions
-# --------------------------
-
+# =========================
+# Helper Functions
+# =========================
 def _table_exists(con, table_name: str) -> bool:
-    """Check if a table exists in DuckDB."""
     try:
         return con.execute(
             "SELECT COUNT(*) FROM information_schema.tables WHERE table_name = ?;",
@@ -36,7 +37,6 @@ def _table_exists(con, table_name: str) -> bool:
         return False
 
 def _largest_trip(con, table_name: str):
-    """Return the single largest CO2-producing trip."""
     sql = f"""
         SELECT
             trip_co2_kgs,
@@ -50,165 +50,180 @@ def _largest_trip(con, table_name: str):
     """
     return con.execute(sql).fetchone()
 
-def _heavy_light_bucket(con, table_name: str, bucket_col: str):
-    """
-    Return most carbon heavy and carbon light bucket for a given time unit
-    (hour_of_day, day_of_week, week_of_year, month_of_year).
-    """
+def _heavy_light_bucket_avg(con, table_name: str, bucket_col: str):
     sql = f"""
-        WITH sums AS (
-            SELECT {bucket_col} AS bucket, SUM(trip_co2_kgs) AS total_co2
+        WITH stats AS (
+            SELECT {bucket_col} AS bucket,
+                   AVG(trip_co2_kgs) AS avg_co2,
+                   COUNT(*)          AS n
             FROM {table_name}
             GROUP BY {bucket_col}
         )
         SELECT
-            (SELECT bucket FROM sums ORDER BY total_co2 DESC LIMIT 1) AS heavy_bucket,
-            (SELECT total_co2 FROM sums ORDER BY total_co2 DESC LIMIT 1) AS heavy_total,
-            (SELECT bucket FROM sums ORDER BY total_co2 ASC LIMIT 1)  AS light_bucket,
-            (SELECT total_co2 FROM sums ORDER BY total_co2 ASC LIMIT 1)  AS light_total;
+            (SELECT bucket FROM stats ORDER BY avg_co2 DESC LIMIT 1),
+            (SELECT avg_co2 FROM stats ORDER BY avg_co2 DESC LIMIT 1),
+            (SELECT n FROM stats ORDER BY avg_co2 DESC LIMIT 1),
+            (SELECT bucket FROM stats ORDER BY avg_co2 ASC LIMIT 1),
+            (SELECT avg_co2 FROM stats ORDER BY avg_co2 ASC LIMIT 1),
+            (SELECT n FROM stats ORDER BY avg_co2 ASC LIMIT 1);
     """
     return con.execute(sql).fetchone()
 
-def _month_series(con, yellow_table: str, green_table: str):
-    """Return monthly total CO2 for Yellow and Green taxis (1–12)."""
+def _month_series_totals(con, yellow_table: str, green_table: str):
     sql = f"""
         WITH y AS (
-            SELECT month_of_year AS month, SUM(trip_co2_kgs) AS total_co2
+            SELECT
+                EXTRACT(year FROM pickup_datetime) AS trip_year,
+                month_of_year AS trip_month,
+                SUM(trip_co2_kgs) AS total_co2
             FROM {yellow_table}
-            GROUP BY month_of_year
+            GROUP BY trip_year, trip_month
         ),
         g AS (
-            SELECT month_of_year AS month, SUM(trip_co2_kgs) AS total_co2
+            SELECT
+                EXTRACT(year FROM pickup_datetime) AS trip_year,
+                month_of_year AS trip_month,
+                SUM(trip_co2_kgs) AS total_co2
             FROM {green_table}
-            GROUP BY month_of_year
+            GROUP BY trip_year, trip_month
+        ),
+        all_months AS (
+            SELECT DISTINCT trip_year, trip_month
+            FROM (
+                SELECT trip_year, trip_month FROM y
+                UNION
+                SELECT trip_year, trip_month FROM g
+            )
         )
         SELECT
-            m AS month,
+            all_months.trip_year,
+            all_months.trip_month,
+            strftime(make_date(all_months.trip_year, all_months.trip_month, 1), '%Y-%m') AS ym_label,
             COALESCE(y.total_co2, 0) AS yellow_total_co2,
             COALESCE(g.total_co2, 0) AS green_total_co2
-        FROM (
-            SELECT UNNEST(GENERATE_SERIES(1,12)) AS m
-        ) months
-        LEFT JOIN y ON y.month = months.m
-        LEFT JOIN g ON g.month = months.m
-        ORDER BY month;
+        FROM all_months
+        LEFT JOIN y
+          ON y.trip_year = all_months.trip_year
+         AND y.trip_month = all_months.trip_month
+        LEFT JOIN g
+          ON g.trip_year = all_months.trip_year
+         AND g.trip_month = all_months.trip_month
+        ORDER BY all_months.trip_year, all_months.trip_month;
     """
     return con.execute(sql).fetchdf()
 
 def _month_name(n: int) -> str:
-    """Map month number to name."""
     names = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"]
     return names[n-1] if 1 <= n <= 12 else str(n)
 
 def _dow_name(n: int) -> str:
-    """Map DuckDB EXTRACT(dow) values (0–6) to day names (Sun–Sat)."""
     names = ["Sun","Mon","Tue","Wed","Thu","Fri","Sat"]
     return names[n] if 0 <= n <= 6 else str(n)
 
-def _print_header(title: str):
-    """Pretty header printing."""
-    print("\n" + "="*len(title))
-    print(title)
-    print("="*len(title))
-
-# --------------------------
-# Main analysis
-# --------------------------
-
+# =========================
+# Main
+# =========================
 def main():
     try:
-        # --- Connect to DuckDB ---
         if not os.path.exists(DB_PATH):
-            msg = f"DuckDB file not found at {DB_PATH}"
-            logger.error(msg)
-            print(msg)
+            print(f"DuckDB file not found at {DB_PATH}")
             sys.exit(1)
-
         con = duckdb.connect(DB_PATH, read_only=True)
         logger.info("Connected to DuckDB for analysis")
 
-        # --- Verify tables exist ---
         for t in (YELLOW_TBL, GREEN_TBL):
             if not _table_exists(con, t):
-                msg = f"Missing required table: {t}"
-                logger.error(msg)
-                print(msg)
+                print(f"Missing required table: {t}")
                 sys.exit(1)
 
-        # 1. Largest carbon-producing trip
-        _print_header("Largest CO2 Trip (kg) for 2024")
+        # Q1. Largest trip
+        print("Question 1. What was the single largest carbon producing trip across 2015–2024?")
         for label, tbl in (("Yellow", YELLOW_TBL), ("Green", GREEN_TBL)):
             row = _largest_trip(con, tbl)
             if row:
                 co2, dist, pu, do = row
-                print(f"{label}: {co2:.4f} kg (distance {dist:.2f} miles, pickup {pu}, dropoff {do})")
+                print(f"{label}: {co2:.4f} kg of CO₂ over {dist:.2f} miles "
+                      f"(pickup={pu}, dropoff={do}).")
             else:
-                print(f"{label}: No data")
+                print(f"{label}: No data found.")
 
-        # 2. Heavy/Light Hour of Day
-        _print_header("Most/Least Carbon Heavy Hour of Day (0–23)")
+        # Q2. Hour of Day
+        print("\nQuestion 2. Over 2015–2024, which hours (1–24) are the most/least carbon heavy?")
         for label, tbl in (("Yellow", YELLOW_TBL), ("Green", GREEN_TBL)):
-            h, ht, l, lt = _heavy_light_bucket(con, tbl, "hour_of_day")
-            print(f"{label}: Heavy hour={h} ({ht:.2f} kg), Light hour={l} ({lt:.2f} kg)")
+            h, ha, hn, l, la, ln = _heavy_light_bucket_avg(con, tbl, "hour_of_day")
+            print(f"{label}: MOST = {int(h)} (avg {ha:.4f} kg, n={hn}), "
+                  f"LEAST = {int(l)} (avg {la:.4f} kg, n={ln})")
 
-        # 3. Heavy/Light Day of Week
-        _print_header("Most/Least Carbon Heavy Day of Week (Sun–Sat)")
+        # Q3. Day of Week
+        print("\nQuestion 3. Over 2015–2024, which days (Sun–Sat) are the most/least carbon heavy?")
         for label, tbl in (("Yellow", YELLOW_TBL), ("Green", GREEN_TBL)):
-            h, ht, l, lt = _heavy_light_bucket(con, tbl, "day_of_week")
-            print(f"{label}: Heavy DOW={_dow_name(int(h))} ({ht:.2f} kg), Light DOW={_dow_name(int(l))} ({lt:.2f} kg)")
+            h, ha, hn, l, la, ln = _heavy_light_bucket_avg(con, tbl, "day_of_week")
+            print(f"{label}: MOST = {_dow_name(int(h))} (avg {ha:.4f} kg, n={hn}), "
+                  f"LEAST = {_dow_name(int(l))} (avg {la:.4f} kg, n={ln})")
 
-        # 4. Heavy/Light Week of Year
-        _print_header("Most/Least Carbon Heavy Week of Year (1–52)")
+        # Q4. Week of Year
+        print("\nQuestion 4. Over 2015–2024, which weeks (1–52) are the most/least carbon heavy?")
         for label, tbl in (("Yellow", YELLOW_TBL), ("Green", GREEN_TBL)):
-            h, ht, l, lt = _heavy_light_bucket(con, tbl, "week_of_year")
-            print(f"{label}: Heavy week={int(h)} ({ht:.2f} kg), Light week={int(l)} ({lt:.2f} kg)")
+            h, ha, hn, l, la, ln = _heavy_light_bucket_avg(con, tbl, "week_of_year")
+            print(f"{label}: MOST = {int(h)} (avg {ha:.4f} kg, n={hn}), "
+                  f"LEAST = {int(l)} (avg {la:.4f} kg, n={ln})")
 
-        # 5. Heavy/Light Month of Year
-        _print_header("Most/Least Carbon Heavy Month of Year (Jan–Dec)")
+        # Q5. Month of Year
+        print("\nQuestion 5. Over 2015–2024, which months (Jan–Dec) are the most/least carbon heavy?")
         for label, tbl in (("Yellow", YELLOW_TBL), ("Green", GREEN_TBL)):
-            h, ht, l, lt = _heavy_light_bucket(con, tbl, "month_of_year")
-            print(f"{label}: Heavy month={_month_name(int(h))} ({ht:.2f} kg), Light month={_month_name(int(l))} ({lt:.2f} kg)")
+            h, ha, hn, l, la, ln = _heavy_light_bucket_avg(con, tbl, "month_of_year")
+            print(f"{label}: MOST = {_month_name(int(h))} (avg {ha:.4f} kg, n={hn}), "
+                  f"LEAST = {_month_name(int(l))} (avg {la:.4f} kg, n={ln})")
 
-        # 6. Plot: monthly CO2 totals (dual-axis)
-        _print_header("Writing monthly CO2 dual-axis plot: monthly_co2_dual_axis.png")
-        monthly = _month_series(con, YELLOW_TBL, GREEN_TBL)
+        # Q6. Monthly plots (separate)
+        print("\nQuestion 6. Monthly CO₂ totals for Yellow and Green (2015–2024).")
+        monthly = _month_series_totals(con, YELLOW_TBL, GREEN_TBL)
         try:
-            x = monthly["month"].tolist()
+            x_labels = monthly["ym_label"].tolist()
             y_yellow = monthly["yellow_total_co2"].tolist()
             y_green = monthly["green_total_co2"].tolist()
 
-            fig, ax1 = plt.subplots(figsize=(10, 5))
-
-            # Yellow on left axis
-            ax1.plot(x, y_yellow, marker="o", color="gold", label="Yellow")
-            ax1.set_xlabel("Month")
-            ax1.set_ylabel("Yellow CO₂ (kg)", color="gold")
-            ax1.tick_params(axis="y", labelcolor="gold")
-
-            # Green on right axis
-            ax2 = ax1.twinx()
-            ax2.plot(x, y_green, marker="o", color="green", label="Green")
-            ax2.set_ylabel("Green CO₂ (kg)", color="green")
-            ax2.tick_params(axis="y", labelcolor="green")
-
-            # Month names on X-axis
-            plt.xticks(x, [_month_name(i) for i in x])
-            plt.title("NYC Taxi CO₂ Totals by Month (2024)")
-            fig.tight_layout()
-
-            plt.savefig("monthly_co2_dual_axis.png", dpi=150)
+            # --- Yellow plot ---
+            plt.figure(figsize=(14, 6))
+            plt.plot(x_labels, y_yellow, marker="o", color="gold", label="Yellow")
+            plt.title("Yellow Taxi CO₂ Totals by Month (2015–2024)")
+            plt.xlabel("Month")
+            plt.ylabel("Total CO₂ (kg)")
+            plt.xticks(ticks=range(0, len(x_labels), 12), labels=x_labels[::12], rotation=45)
+            plt.legend()
+            # remove top and right border
+            plt.gca().spines['top'].set_visible(False)
+            plt.gca().spines['right'].set_visible(False)
+            plt.tight_layout()
+            plt.savefig("monthly_co2_yellow.png", dpi=150)
             plt.close()
-            print("Saved plot to monthly_co2_dual_axis.png")
+
+            # --- Green plot ---
+            plt.figure(figsize=(14, 6))
+            plt.plot(x_labels, y_green, marker="o", color="green", label="Green")
+            plt.title("Green Taxi CO₂ Totals by Month (2015–2024)")
+            plt.xlabel("Month")
+            plt.ylabel("Total CO₂ (kg)")
+            plt.xticks(ticks=range(0, len(x_labels), 12), labels=x_labels[::12], rotation=45)
+            plt.legend()
+            plt.gca().spines['top'].set_visible(False)
+            plt.gca().spines['right'].set_visible(False)
+            plt.tight_layout()
+            plt.savefig("monthly_co2_green.png", dpi=150)
+            plt.close()
+
+            print("Saved plots: monthly_co2_yellow.png and monthly_co2_green.png")
+            logger.info("Saved monthly plots")
         except Exception as e:
-            logger.error(f"Plotting failed: {e}")
             print(f"Plotting failed: {e}")
+            logger.error(f"Plotting failed: {e}")
 
         con.close()
         logger.info("Analysis complete")
 
     except Exception as e:
-        logger.error(f"Analysis failed: {e}")
         print(f"Analysis failed: {e}")
+        logger.error(f"Analysis failed: {e}")
         sys.exit(1)
 
 if __name__ == "__main__":
